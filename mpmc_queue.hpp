@@ -33,11 +33,12 @@
 //   tail = X, sleeps, then later finds tail = X again but it's a DIFFERENT
 //   node X that happens to have been re-allocated at the same address.
 //
-//   We avoid ABA here by NEVER freeing dequeued nodes. Each enqueue news
-//   a node; each dequeue returns the payload but leaks the node. This is
-//   honest about what the queue is: a learning project that demonstrates
-//   the algorithm, not a production datastructure. A real implementation
-//   would use hazard pointers or epoch-based reclamation.
+//   We avoid ABA here by deferring reclamation until the queue is destroyed.
+//   Each dequeue retires the old dummy node on a separate list, so it is never
+//   re-used while concurrent operations may still hold its address. This keeps
+//   the learning implementation simple while ensuring a finished queue releases
+//   all of its allocations. A long-lived production queue should use hazard
+//   pointers or epoch-based reclamation to reclaim retired nodes incrementally.
 //
 //   (You can also pair this with a typed memory pool that recycles nodes
 //   only after a grace period — same idea as RCU.)
@@ -67,6 +68,12 @@ public:
         Node* n = head_.load(std::memory_order_relaxed);
         while (n) {
             Node* next = n->next.load(std::memory_order_relaxed);
+            delete n;
+            n = next;
+        }
+        n = retired_.load(std::memory_order_relaxed);
+        while (n) {
+            Node* next = n->retired_next;
             delete n;
             n = next;
         }
@@ -152,9 +159,7 @@ public:
                     head, next,
                     std::memory_order_release,
                     std::memory_order_relaxed)) {
-                // Note: we intentionally don't `delete head`. See the ABA
-                // caveat at the top of this file. The head node becomes
-                // garbage but is safe to leak in this learning impl.
+                retire(head);
                 return value;
             }
             // CAS lost; retry.
@@ -173,6 +178,7 @@ private:
     struct Node {
         T                  value;
         std::atomic<Node*> next{nullptr};
+        Node*              retired_next = nullptr;
 
         Node() = default;
         explicit Node(T v) : value(std::move(v)) {}
@@ -184,6 +190,15 @@ private:
     // cached copy and vice versa.
     alignas(64) std::atomic<Node*> head_;
     alignas(64) std::atomic<Node*> tail_;
+    std::atomic<Node*> retired_{nullptr};
+
+    void retire(Node* node) {
+        Node* previous = retired_.load(std::memory_order_relaxed);
+        do {
+            node->retired_next = previous;
+        } while (!retired_.compare_exchange_weak(
+            previous, node, std::memory_order_release, std::memory_order_relaxed));
+    }
 };
 
 } // namespace lockfree
